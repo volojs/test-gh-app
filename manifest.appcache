@@ -1,0 +1,15 @@
+CACHE MANIFEST
+# 1okpgayGvXKAFEGjFRPAauTU+8M=
+
+CACHE:
+css/app.css
+img/glyphicons-halflings-white.png
+img/glyphicons-halflings.png
+index.html
+js/app.js
+
+# catch-all for anything else
+NETWORK:
+*
+http://*
+https://*

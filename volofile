@@ -1,0 +1,331 @@
+/*jslint regexp: true */
+/*global define, console, process */
+
+define(function (require) {
+    'use strict';
+
+    var amdify = require('amdify'),
+        q = require('q'),
+        crypto = require('crypto'),
+        fs = require('fs'),
+        path = require('path'),
+        forGitHubPages = true,
+        skipFlattenForGitHubPages = false;
+
+    //Cleans up the
+    function flattenForGitHubPages(v) {
+        if (!forGitHubPages || skipFlattenForGitHubPages) {
+            return;
+        }
+
+        //Move the contents of www-built to the top level
+        fs.readdirSync('www-built').forEach(function (item) {
+            var target = path.join('.', item);
+
+            if (v.exists(target)) {
+                v.rm(target);
+            }
+
+            v.mv(path.join('www-built', item), target);
+        });
+
+        //Remove the www-built directory, since it should not be committed
+        //into the github branch.
+        v.rm('www-built');
+    }
+
+    return {
+        //Run as the result of first setting up this project via a
+        //"volo create" call. Gets the twitter bootstrap code, and
+        //jQuery.
+        onCreate: {
+            run: function (d, v, namedArgs) {
+                var tempName = 'tempbootstrap',
+                    jsNameRegExp = /bootstrap-(\w*)\.js$/;
+
+                //Grab the twitter bootstrap and jQuery
+                v.command('create', tempName, 'twitter/bootstrap')
+                .then(function () {
+                    return v.command('add', 'jquery/jquery/1.7.2');
+                })
+                .then(function (result) {
+                    //Move the JS to the right location.
+                    var jsFiles = v.getFilteredFileList(tempName + '/js', /\.js$/, /js\/tests\//),
+                        promises = [];
+
+                    jsFiles.forEach(function (file) {
+                        //Pull off the name part from bootstrap-name.js pattern.
+                        var name = jsNameRegExp.exec(file)[1],
+                            destName = 'www/js/bootstrap/' + name + '.js',
+                            damd = q.defer();
+
+                        v.copyFile(file, destName);
+
+                        //Convert the file to AMD style
+                        amdify.run.apply(amdify, [damd, v, {
+                            depends: 'jquery'
+                        }, destName]);
+
+                        promises.push(damd);
+                    });
+
+                    //Wait for all the amdify calls to finish.
+                    q.all(promises)
+                    .then(function (value) {
+
+                        //Copy the images over.
+                        v.copyDir(tempName + '/img', 'www/img');
+
+                        //Copy the less files.
+                        v.copyDir(tempName + '/less', 'tools/less');
+
+                        //Compile the CSS.
+                        v.command('less').then(function () {
+                            v.rm(tempName);
+                        })
+                        .then(function () {
+                            //Ask if this is a project for GitHub
+                            return v.prompt('Will this be an app hosted on ' +
+                                            'GitHub Pages [n]? ');
+                        })
+                        .then(function (value) {
+                            if (value && value.charAt(0).toLowerCase() === 'y') {
+                                //Modify this file and change the GitHub
+                                //Pages to true.
+                                v.write('volofile', v.read('volofile')
+                                        .replace(/forGitHubPages = false/,
+                                                 'forGitHubPages = true'));
+
+                                //Create a file that indicates GitHub's jekyll
+                                //is not needed.
+                                v.write('.nojekyll', '');
+                            }
+                        })
+                        .then(d.resolve, d.reject);
+
+                    }).fail(d.reject);
+                })
+                .fail(d.reject);
+            }
+        },
+
+        //Builds the JS and CSS into one file each. If you want to do
+        //dynamic loading of scripts, pass -dynamic to the build, and
+        //require.js will be used to load scripts.
+        build: {
+            flags: {
+                //Does not print the build output.
+                'q': 'quiet',
+                //Uses dynamic loading via require.js instead of building
+                //all the modules in with almond.
+                'dynamic': 'dynamic'
+            },
+
+            run: function (d, v, namedArgs) {
+                q.call(function () {
+                    //Remove the old build.
+                    if (v.exists('www-built')) {
+                        v.rm('www-built');
+                    }
+
+                    if (!namedArgs.dynamic) {
+                        //Copy the directory for output.
+                        v.copyDir('www', 'www-built');
+
+                        //Remove the js dir from the built area, will be
+                        //replaced by an optimized app.js
+                        v.rm('www-built/js');
+
+                        //Do the CSS optimization
+                        return v.spawn('node', ['tools/r.js', '-o',
+                                                'cssIn=www/css/app.css',
+                                                'out=www-built/css/app.css'], {
+                            useConsole: !namedArgs.quiet
+                        });
+                    }
+                    return undefined;
+                })
+                .then(function () {
+                    //JS go time
+                    var optimize = namedArgs.optimize || 'uglify';
+
+                    if (namedArgs.dynamic) {
+                        //Still use require.js to load the app.js file.
+                        return v.spawn('node', ['tools/r.js', '-o',
+                                        'appDir=www',
+                                        'baseUrl=js',
+                                        'name=app',
+                                        'dir=www-built',
+                                        'optimize=' + optimize], {
+                            useConsole: !namedArgs.quiet
+                        });
+                    } else {
+                        //The all-in-one option.
+                        return v.spawn('node', ['tools/r.js', '-o',
+                                        'baseUrl=www/js',
+                                        'paths.almond=../../tools/almond',
+                                        'name=almond',
+                                        'include=app',
+                                        'out=www-built/js/app.js',
+                                        'optimize=' + optimize], {
+                            useConsole: !namedArgs.quiet
+                        });
+                    }
+                })
+                .then(function (buildOutput) {
+                    //Remove all the CSS except for the app.css, since it
+                    //inlines all the other ones.
+                    v.getFilteredFileList('www-built/css').forEach(function (path) {
+                        if (!/app\.css$/.test(path)) {
+                            v.rm(path);
+                        }
+                    });
+
+                    //If almond is in use, it is built into app.js, so need
+                    //to update the script tag to just load app.js instead.
+                    if (!namedArgs.dynamic) {
+                        var indexName = 'www-built/index.html',
+                            contents = v.read(indexName),
+                            scriptRegExp = /(<script[^>]+data-main="[^"]+"[^>]+)(src="[^"]+")([^>]+>\s*<\/script>)/;
+
+                        contents = contents.replace(scriptRegExp,
+                            function (match, pre, script, post) {
+                            return pre + 'src="js/app.js"' + post;
+                        });
+
+                        v.write(indexName, contents);
+                    }
+                    return buildOutput;
+                })
+                .then(function (buildOutput) {
+                    flattenForGitHubPages(v);
+                    return buildOutput;
+                })
+                .then(function (buildOutput) {
+                    d.resolve(buildOutput);
+                }, d.reject);
+            }
+        },
+
+        //Generates an SHA1 digest that represents the contents of the
+        //a directory. Call it like so: "volo digest dir=path/to/directory"
+        digest: {
+            validate: function (namedArgs) {
+                var dir = namedArgs.dir;
+                if (!dir) {
+                    return new Error('Please specify a target directory for ' +
+                                     'the digest');
+                }
+                if (!path.existsSync(dir)) {
+                    return new Error('Target directory for digest does ' +
+                                     'not exist: ' + dir);
+                }
+                return undefined;
+            },
+
+            run: function (d, v, namedArgs) {
+                var dir = namedArgs.dir,
+                    files = v.getFilteredFileList(dir),
+                    digests = [],
+                    i = 0;
+
+                function getDigest(fileName) {
+                    var shaSum = crypto.createHash('sha1'),
+                        d = q.defer(),
+                        stream = fs.ReadStream(fileName);
+
+                    stream.on('data', function(data) {
+                        shaSum.update(data);
+                    });
+
+                    stream.on('end', function() {
+                        d.resolve(shaSum.digest('base64'));
+                    });
+
+                    return d.promise;
+                }
+
+                function digestFile(fileName) {
+                    getDigest(fileName).then(function (digest) {
+                        var shaSum;
+
+                        digests[i] = digest;
+                        i += 1;
+
+                        if (i < files.length) {
+                            digestFile(files[i]);
+                        } else {
+                            //All done, now generate the final digest,
+                            //using the combination of the other digests
+                            shaSum = crypto.createHash('sha1');
+                            shaSum.update(digests.join(','));
+                            d.resolve(shaSum.digest('base64'));
+                        }
+                    });
+                }
+
+                digestFile(files[0]);
+            }
+        },
+
+        //Runs less on the .less files in tools/less to generate the CSS files.
+        less: function (d, v, namedArgs) {
+            q.all([
+                v.exec('node tools/oneless.js tools/less/bootstrap.less > www/css/bootstrap.css'),
+                v.exec('node tools/oneless.js tools/less/responsive.less > www/css/bootstrap-responsive.css')
+            ])
+            .then(function () {
+                d.resolve();
+            })
+            .fail(d.reject);
+        },
+
+        appcache: function (d, v, namedArgs) {
+            var hasBuilt = v.exists('www-built');
+
+            //Delay the flattening until later.
+            skipFlattenForGitHubPages = true;
+
+            v.command('build')
+            .then(function () {
+                var manifest = v.read('./tools/manifest.appcache'),
+                    master = v.read('./www-built/index.html'),
+                    appFiles;
+
+                //Reset skipFlatten flag
+                skipFlattenForGitHubPages = false;
+
+                appFiles = v.getFilteredFileList('www-built');
+                appFiles = appFiles.map(function (file) {
+                    var start = file.indexOf('/www-built/');
+                    start = (start !== -1) ? (start + 11) : 0;
+                    return file.substr(start, file.length);
+                });
+
+                master = master
+                        .replace(/<html\s?/, '<html manifest="manifest.appcache" ')
+                        .replace(/manifest\.appcache"\s>/, 'manifest.appcache">');
+                v.write('www-built/index.html', master);
+
+                return v.command('digest', 'dir=www-built')
+                .then(function (stamp) {
+                    manifest = v.template(manifest, {
+                        files : appFiles.join('\n'),
+                        stamp : stamp
+                    });
+                    v.write('www-built/manifest.appcache', manifest);
+                });
+            })
+            .then(function () {
+                flattenForGitHubPages(v);
+            })
+            .then(function () {
+                //Inform the user of the right mime type, but only do it if
+                //there was not a previous build done.
+                d.resolve(hasBuilt ? '': 'Be sure to set the mime type for ' +
+                          '.appcache files to be: text/cache-manifest');
+            })
+            .fail(d.reject);
+        }
+    };
+});
