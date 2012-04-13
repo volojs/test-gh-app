@@ -1,12 +1,16 @@
 CACHE MANIFEST
-# 1okpgayGvXKAFEGjFRPAauTU+8M=
+# K9wIJsDS+T5JgXnBVC6V1Qr81CA=
 
 CACHE:
 css/app.css
 img/glyphicons-halflings-white.png
 img/glyphicons-halflings.png
+img/icon-128.png
+img/icon-16.png
+img/icon-48.png
 index.html
 js/app.js
+manifest.webapp
 
 # catch-all for anything else
 NETWORK:
